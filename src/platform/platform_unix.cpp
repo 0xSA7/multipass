@@ -224,18 +224,18 @@ int mp::platform::Platform::fstat_attr_from(int fd, sftp_attributes_struct& attr
     return 0;
 }
 
-ssize_t mp::platform::Platform::pread(int fd,
-                                      void* buffer,
-                                      size_t bytes_to_read,
-                                      off_t offset) const
+std::ptrdiff_t mp::platform::Platform::pread(int fd,
+                                             void* buffer,
+                                             size_t bytes_to_read,
+                                             off_t offset) const
 {
     return ::pread(fd, buffer, bytes_to_read, offset);
 }
 
-ssize_t mp::platform::Platform::pwrite(int fd,
-                                       void* buffer,
-                                       size_t bytes_to_write,
-                                       off_t offset) const
+std::ptrdiff_t mp::platform::Platform::pwrite(int fd,
+                                              void* buffer,
+                                              size_t bytes_to_write,
+                                              off_t offset) const
 {
     return ::pwrite(fd, buffer, bytes_to_write, offset);
 }

@@ -934,7 +934,7 @@ int mp::SftpServer::handle_readdir(sftp_client_message msg)
                        std::strerror(errno));
             return reply_failure(msg);
         }
-        const auto longname = longname_from(attr, path);
+        const auto longname = longname_from(attr, path_string);
         sftp_reply_names_add(msg, path.filename().string().c_str(), longname.data(), &attr);
     }
 

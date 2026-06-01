@@ -2259,7 +2259,7 @@ TEST_F(SftpServer, setstatResizeFailureFails)
 
     const auto [mock_file_ops, guard] = mpt::MockFileOps::inject();
     EXPECT_CALL(*mock_file_ops, resize(_, _, _))
-        .WillOnce([](const fs::path&, uint64_t, std::error_code& ec) {
+        .WillOnce([](const fs::path&, std::uintmax_t, std::error_code& ec) {
             ec.assign(1, std::generic_category());
         });
     EXPECT_CALL(*mock_file_ops, exists(A<const fs::path&>()))
