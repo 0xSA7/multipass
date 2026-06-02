@@ -652,7 +652,7 @@ int mp::SftpServer::handle_mkdir(sftp_client_message msg)
         return reply_perm_denied(msg);
     }
 
-    std::error_code ec;
+    std::error_code ec{};
     if (!MP_FILEOPS.create_directory(*filename, ec) || ec)
     {
         // If the directory exists, return failure
@@ -709,7 +709,7 @@ int mp::SftpServer::handle_rmdir(sftp_client_message msg)
         return reply_perm_denied(msg);
     }
 
-    std::error_code err;
+    std::error_code err{};
     if (!MP_FILEOPS.remove(*filename, err) && !err)
         err = std::make_error_code(std::errc::no_such_file_or_directory);
 
@@ -793,7 +793,7 @@ int mp::SftpServer::handle_open(sftp_client_message msg)
     auto named_fd_handle =
         MP_FILEOPS.open_fd(*filename, mode, msg->attr ? msg->attr->permissions : 0);
     auto& named_fd = std::get<std::unique_ptr<NamedFd>>(named_fd_handle);
-    if (!named_fd || named_fd->fd == -1)
+    if (!named_fd.get() || named_fd->fd == -1)
     {
         mpl::trace(category, "Cannot open '{}': {}", filename->string(), std::strerror(errno));
         return reply_failure(msg);
@@ -835,7 +835,7 @@ int mp::SftpServer::handle_opendir(sftp_client_message msg)
     if (!filename.has_value())
         return reply_perm_denied(msg);
 
-    std::error_code err;
+    std::error_code err{};
     sftp_attributes_struct attr{};
     const auto res = MP_PLATFORM.stat_attr_from(filename->string().c_str(),
                                                 attr); // First stat to minimize TOCTOU impact
@@ -872,7 +872,7 @@ int mp::SftpServer::handle_opendir(sftp_client_message msg)
         return reply_failure(msg);
     }
 
-    open_sftp_handles.emplace(dir_iter_ptr, std::move(dir_iterator));
+    open_sftp_handles.emplace(dir_iter_ptr, std::move(dir_iterator_handle));
 
     return sftp_reply_handle(msg, sftp_handle.get());
 }
@@ -961,7 +961,7 @@ int mp::SftpServer::handle_readlink(sftp_client_message msg)
         return reply_perm_denied(msg);
     }
 
-    std::error_code ec;
+    std::error_code ec{};
     // We give the raw stored link when reading, block on openat
     const auto raw_link = MP_FILEOPS.read_symlink(*filename, ec);
     if (ec)
@@ -1044,7 +1044,7 @@ int mp::SftpServer::handle_remove(sftp_client_message msg)
         return reply_failure(msg);
     }
 
-    std::error_code err;
+    std::error_code err{};
     if (!MP_FILEOPS.remove(*filename, err) && !err)
         err = std::make_error_code(std::errc::no_such_file_or_directory);
 
@@ -1110,7 +1110,7 @@ int mp::SftpServer::handle_rename(sftp_client_message msg, const bool allow_over
     }
 
     // Perform the rename
-    std::error_code ec;
+    std::error_code ec{};
     if (MP_FILEOPS.rename(*source, target, ec); ec)
     {
         mpl::trace_location(category,
@@ -1223,7 +1223,7 @@ int mp::SftpServer::handle_setstat(sftp_client_message msg)
 
     if (msg->attr->flags & SSH_FILEXFER_ATTR_SIZE)
     {
-        std::error_code ec;
+        std::error_code ec{};
         if (MP_FILEOPS.resize(*filepath, msg->attr->size, ec); ec)
         {
             mpl::trace_location(category, "cannot resize '{}'", path_string);
@@ -1379,7 +1379,7 @@ int mp::SftpServer::handle_symlink(sftp_client_message msg)
     }
 
     fs::path secure_target_path{link_parent_path / symlink_target};
-    std::error_code ec;
+    std::error_code ec{};
     // Needed for windows
     bool target_is_dir{MP_FILEOPS.is_directory(secure_target_path, ec)};
 

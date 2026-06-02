@@ -75,6 +75,8 @@
 #include <sys/stat.h>
 // clang-format on
 #include <windows.h>
+#include <winbase.h>
+#include <winioctl.h>
 #include <winternl.h>
 
 #include <algorithm>
@@ -114,12 +116,12 @@ FILETIME filetime_from(const time_t t)
     return ft;
 }
 
-uint64_t size_from(DWORD nFileSizeHigh, DWORD nFileSizeLow)
+size_t size_from(DWORD nFileSizeHigh, DWORD nFileSizeLow)
 {
     return (static_cast<uint64_t>(nFileSizeHigh) << 32) + nFileSizeLow;
 }
 
-sftp_attributes_struct stat_to_attr(const _stat64& file_data)
+sftp_attributes_struct stat_to_attr(const struct _stat64& file_data)
 {
     sftp_attributes_struct attr{};
 
@@ -137,60 +139,69 @@ sftp_attributes_struct stat_to_attr(const _stat64& file_data)
     if ((file_data.st_mode & _S_IFREG) == _S_IFREG)
         attr.permissions |= SSH_S_IFREG;
     else if ((file_data.st_mode & _S_IFDIR) == _S_IFDIR)
-        attr.permissions |= SSH_S_IFDIR | static_cast<int32_t>(fs::perms::others_exec) |
-                            static_cast<int32_t>(fs::perms::group_exec) |
-                            static_cast<int32_t>(fs::perms::owner_exec);
+        attr.permissions |= SSH_S_IFDIR |
+                            static_cast<uint32_t>(fs::perms::others_exec | fs::perms::group_exec |
+                                                  fs::perms::owner_exec);
     else // Symlink not a possibility in Windows CRT fstat or stat
          // Keep the filetype flag if other
         attr.permissions |= (file_data.st_mode & _S_IFMT);
 
     if ((file_data.st_mode & _S_IREAD) == _S_IREAD)
-        attr.permissions |= static_cast<int32_t>(fs::perms::others_read) |
-                            static_cast<int32_t>(fs::perms::group_read) |
-                            static_cast<int32_t>(fs::perms::owner_read);
+        attr.permissions |= static_cast<int32_t>(fs::perms::others_read | fs::perms::group_read |
+                                                 fs::perms::owner_read);
     if ((file_data.st_mode & _S_IWRITE) == _S_IWRITE)
         attr.permissions |= static_cast<int32_t>(fs::perms::owner_write); // Only user can write
     if ((file_data.st_mode & _S_IEXEC) == _S_IEXEC)
-        attr.permissions |= static_cast<int32_t>(fs::perms::others_exec) |
-                            static_cast<int32_t>(fs::perms::group_exec) |
-                            static_cast<int32_t>(fs::perms::owner_exec);
+        attr.permissions |= static_cast<int32_t>(fs::perms::others_exec | fs::perms::group_exec |
+                                                 fs::perms::owner_exec);
 
     return attr;
 }
 
-sftp_attributes_struct stat_to_attr(const WIN32_FIND_DATAA& file_data)
+sftp_attributes_struct stat_to_attr(const BY_HANDLE_FILE_INFORMATION& file_data,
+                                    const HANDLE file_handle)
 {
     sftp_attributes_struct attr{};
 
     attr.uid = -2;
     attr.gid = -2;
 
+    attr.size = size_from(file_data.nFileSizeHigh, file_data.nFileSizeLow);
     attr.flags = SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_UIDGID | SSH_FILEXFER_ATTR_PERMISSIONS |
                  SSH_FILEXFER_ATTR_ACMODTIME;
 
     attr.atime = time_t_from(&(file_data.ftLastAccessTime));
     attr.mtime = time_t_from(&(file_data.ftLastWriteTime));
 
-    attr.size = size_from(file_data.nFileSizeHigh, file_data.nFileSizeLow);
-
     attr.permissions =
-        (static_cast<int32_t>(fs::perms::all) & ~(static_cast<int32_t>(fs::perms::group_write) |
-                                                  static_cast<int32_t>(fs::perms::others_write)));
-    // Default is 0755
+        static_cast<uint32_t>(fs::perms::all & ~(fs::perms::group_write | fs::perms::others_write));
 
-    if ((file_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-        (file_data.dwReserved0 == IO_REPARSE_TAG_SYMLINK))
+    if (file_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
     {
-        attr.permissions |=
-            SSH_S_IFLNK | static_cast<int32_t>(fs::perms::group_write) |
-            static_cast<int32_t>(fs::perms::others_write); // Symlinks have 0777 by default
+        FILE_ATTRIBUTE_TAG_INFO tagInfo{};
+        if (GetFileInformationByHandleEx(file_handle,
+                                         FileAttributeTagInfo,
+                                         &tagInfo,
+                                         sizeof(tagInfo)) &&
+            (tagInfo.ReparseTag == IO_REPARSE_TAG_SYMLINK ||
+             tagInfo.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT))
+        {
+            // TODO: Windows prepends the extended path prefix "\\?\", which we
+            // may want to strip in the total count
+            attr.size = GetFinalPathNameByHandleA(file_handle, NULL, 0, VOLUME_NAME_DOS);
+            if (attr.size >= 4)
+                attr.size -= 4;
+            attr.permissions |= static_cast<uint32_t>(
+                fs::perms::group_write | fs::perms::others_write); // Symlinks have 0777 by default
+            attr.permissions |= SSH_S_IFLNK;
+        }
     }
     else if (file_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
     {
         attr.permissions |= SSH_S_IFDIR; // Directories are 0755 by default
         if (file_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
         {
-            attr.permissions &= ~static_cast<int32_t>(fs::perms::owner_write);
+            attr.permissions &= ~static_cast<uint32_t>(fs::perms::owner_write);
         }
     }
     else
@@ -198,7 +209,7 @@ sftp_attributes_struct stat_to_attr(const WIN32_FIND_DATAA& file_data)
         attr.permissions |= SSH_S_IFREG; // Files 0755 by default
         if (file_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
         {
-            attr.permissions &= ~static_cast<int32_t>(fs::perms::owner_write);
+            attr.permissions &= ~static_cast<uint32_t>(fs::perms::owner_write);
         }
     }
 
@@ -570,7 +581,7 @@ DWORD set_specific_perms(LPSTR path, WELL_KNOWN_SID_TYPE sid_type, DWORD access_
     return set_specific_perms(path, pSid.get(), access_mask, inherit);
 }
 
-DWORD convert_permissions(int unix_perms)
+DWORD convert_permissions(uint32_t unix_perms)
 {
     DWORD access_mask = 0;
     if (unix_perms & 0444)
@@ -580,7 +591,7 @@ DWORD convert_permissions(int unix_perms)
     if (unix_perms & 0111)
         access_mask |= GENERIC_EXECUTE;
 
-    return access_mask;
+    return static_cast<DWORD>(access_mask);
 }
 
 // Since the Windows API expects a C style function pointer, we cannot pass parameters.
@@ -1159,7 +1170,7 @@ bool mp::platform::Platform::set_permissions(const std::filesystem::path& path,
     std::filesystem::permissions(path, permissions, ec);
 
     // Rest handles ACLs
-    auto perms{static_cast<int32_t>(permissions)};
+    auto perms{static_cast<uint32_t>(permissions)};
     auto path_str = path.string();
     LPSTR lpPath = const_cast<LPSTR>(path_str.c_str()); // Guaranteed null terminated string
     auto success = true;
@@ -1175,14 +1186,14 @@ bool mp::platform::Platform::set_permissions(const std::filesystem::path& path,
                          newACL.get(),
                          nullptr);
 
-    if (int others = perms & static_cast<int32_t>(fs::perms::others_all); others != 0)
+    if (uint32_t others = perms & static_cast<uint32_t>(fs::perms::others_all); others != 0)
         success &= set_specific_perms(lpPath, WinWorldSid, convert_permissions(others), inherit) ==
                    ERROR_SUCCESS;
-    if (int group = perms & static_cast<int32_t>(fs::perms::group_all); group != 0)
+    if (uint32_t group = perms & static_cast<uint32_t>(fs::perms::group_all); group != 0)
         success &=
             set_specific_perms(lpPath, WinCreatorGroupSid, convert_permissions(group), inherit) ==
             ERROR_SUCCESS;
-    if (int owner = perms & static_cast<int32_t>(fs::perms::owner_all); owner != 0)
+    if (uint32_t owner = perms & static_cast<uint32_t>(fs::perms::owner_all); owner != 0)
         success &=
             set_specific_perms(lpPath, WinCreatorOwnerSid, convert_permissions(owner), inherit) ==
             ERROR_SUCCESS;
@@ -1352,64 +1363,126 @@ QString mp::platform::Platform::multipass_storage_location() const
 
 int mp::platform::Platform::lstat_attr_from(const char* path, sftp_attributes_struct& attr) const
 {
-    WIN32_FIND_DATAA data;
-
-    // 0 signals failure
-    if (HANDLE file_handle = FindFirstFileA(path, &data); file_handle != INVALID_HANDLE_VALUE)
+    HANDLE file_handle =
+        CreateFileA(path,
+                    0, // 0 access rights is enough to query metadata without read/write locks
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    NULL);
+    if (file_handle != INVALID_HANDLE_VALUE)
     {
-        attr = stat_to_attr(data);
-        FindClose(file_handle);
-        return 0;
-    }
-    else
-    {
-        DWORD win_err = GetLastError();
+        BY_HANDLE_FILE_INFORMATION file_info;
 
-        // Map common Win32 errors to standard POSIX errno values
-        switch (win_err)
+        if (GetFileInformationByHandle(file_handle, &file_info) != 0)
+        // 0 signals failure
         {
-        case ERROR_FILE_NOT_FOUND:
-        case ERROR_PATH_NOT_FOUND:
-        case ERROR_INVALID_NAME:
-        case ERROR_BAD_NETPATH:
-        case ERROR_BAD_PATHNAME:
-            errno = ENOENT;
-            break;
+            attr = stat_to_attr(file_info, file_handle);
 
-        case ERROR_ACCESS_DENIED:
-        case ERROR_SHARING_VIOLATION:
-            errno = EACCES;
-            break;
-
-        case ERROR_OUTOFMEMORY:
-            errno = ENOMEM;
-            break;
-
-        case ERROR_INVALID_PARAMETER:
-            errno = EINVAL;
-            break;
-
-        case ERROR_TOO_MANY_OPEN_FILES:
-            errno = EMFILE;
-            break;
-
-        default:
-            // Fallback for unmapped errors
-            errno = ENOENT;
-            break;
+            CloseHandle(file_handle);
+            return 0;
         }
 
-        return -1; // Standard lstat failure return code
+        CloseHandle(file_handle);
     }
+    DWORD win_err = GetLastError();
+
+    // Map common Win32 errors to standard POSIX errno values
+    switch (win_err)
+    {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_PATHNAME:
+        errno = ENOENT;
+        break;
+
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+        errno = EACCES;
+        break;
+
+    case ERROR_OUTOFMEMORY:
+        errno = ENOMEM;
+        break;
+
+    case ERROR_INVALID_PARAMETER:
+        errno = EINVAL;
+        break;
+
+    case ERROR_TOO_MANY_OPEN_FILES:
+        errno = EMFILE;
+        break;
+
+    default:
+        errno = ENOENT;
+        break;
+    }
+    return -1; // Standard lstat failure return code
 }
 
 int mp::platform::Platform::stat_attr_from(const char* path, sftp_attributes_struct& attr) const
 {
-    struct _stat64 st{};
-    if (_stat64(path, &st) != 0)
-        return -1;
-    attr = stat_to_attr(st);
-    return 0;
+    HANDLE file_handle =
+        CreateFileA(path,
+                    0, // 0 access rights is enough to query metadata without read/write locks
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    NULL);
+    if (file_handle != INVALID_HANDLE_VALUE)
+    {
+        BY_HANDLE_FILE_INFORMATION file_info;
+
+        if (GetFileInformationByHandle(file_handle, &file_info) != 0)
+        // 0 signals failure
+        {
+            attr = stat_to_attr(file_info, file_handle);
+
+            CloseHandle(file_handle);
+            return 0;
+        }
+
+        CloseHandle(file_handle);
+    }
+    DWORD win_err = GetLastError();
+
+    // Map common Win32 errors to standard POSIX errno values
+    switch (win_err)
+    {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_PATHNAME:
+        errno = ENOENT;
+        break;
+
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+        errno = EACCES;
+        break;
+
+    case ERROR_OUTOFMEMORY:
+        errno = ENOMEM;
+        break;
+
+    case ERROR_INVALID_PARAMETER:
+        errno = EINVAL;
+        break;
+
+    case ERROR_TOO_MANY_OPEN_FILES:
+        errno = EMFILE;
+        break;
+
+    default:
+        errno = ENOENT;
+        break;
+    }
+    return -1; // Standard lstat failure return code
 }
 
 int mp::platform::Platform::fstat_attr_from(int fd, sftp_attributes_struct& attr) const
@@ -1426,7 +1499,7 @@ int mp::platform::Platform::fstat_attr_from(int fd, sftp_attributes_struct& attr
 std::ptrdiff_t mp::platform::Platform::pread(int fd,
                                              void* buffer,
                                              size_t bytes_to_read,
-                                             off_t offset) const
+                                             std::ptrdiff_t offset) const
 {
     HANDLE file_handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     if (file_handle == INVALID_HANDLE_VALUE)
@@ -1487,7 +1560,7 @@ std::ptrdiff_t mp::platform::Platform::pread(int fd,
 std::ptrdiff_t mp::platform::Platform::pwrite(int fd,
                                               void* buffer,
                                               size_t bytes_to_write,
-                                              off_t offset) const
+                                              std::ptrdiff_t offset) const
 {
     HANDLE file_handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     if (file_handle == INVALID_HANDLE_VALUE)
@@ -1540,14 +1613,14 @@ std::ptrdiff_t mp::platform::Platform::pwrite(int fd,
     return -1;
 }
 
-int mp::platform::Platform::ftruncate(int fd, off_t length) const
+int mp::platform::Platform::ftruncate(int fd, std::ptrdiff_t length) const
 {
-    return _chsize_s(fd, length);
+    return ::_chsize_s(fd, length);
 }
 
 int mp::platform::Platform::futimes(int fd, int atime, int mtime) const
 {
-    struct __utimbuf64 ut;
+    struct __utimbuf64 ut{};
     ut.actime = atime;
     ut.modtime = mtime;
     return ::_futime64(fd, &ut);
