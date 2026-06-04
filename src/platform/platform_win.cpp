@@ -97,6 +97,23 @@ namespace
 {
 static const auto none = QStringLiteral("none");
 static constexpr auto log_category = "platform-win";
+// Always added to owner ACE — ensures the owner can always recover
+// permissions even after chmod 000. Contains no data bits so mask_to_posix
+// is unaffected.
+static constexpr ACCESS_MASK MIN_MANAGEMENT_RIGHTS =
+    READ_CONTROL |         // read security descriptor (lstat, get_posix_security)
+    WRITE_DAC |            // modify DACL (set_posix_security)
+    WRITE_OWNER |          // change owner
+    DELETE |               // delete file
+    FILE_READ_ATTRIBUTES | // stat without data access
+    SYNCHRONIZE;           // required to open any handle
+
+struct PosixSecurity
+{
+    std::optional<uint32_t> perms;
+    std::optional<uint32_t> uid;
+    std::optional<uint32_t> gid;
+};
 
 time_t time_t_from(const FILETIME* ft)
 {
@@ -119,6 +136,351 @@ FILETIME filetime_from(const time_t t)
 size_t size_from(DWORD nFileSizeHigh, DWORD nFileSizeLow)
 {
     return (static_cast<uint64_t>(nFileSizeHigh) << 32) + nFileSizeLow;
+}
+
+// For ALLOW ACEs: full GENERIC_* mapping including standard rights
+ACCESS_MASK to_allow_mask(uint32_t rwx)
+{
+    ACCESS_MASK mask = 0;
+    if (rwx & 4)
+        mask |= FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+    if (rwx & 2)
+        mask |= FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_APPEND_DATA |
+                READ_CONTROL | SYNCHRONIZE;
+    if (rwx & 1)
+        mask |= FILE_EXECUTE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+    return mask;
+}
+
+// For DENY ACEs: data bits only — never deny READ_CONTROL, SYNCHRONIZE,
+// or other standard rights. Denying GENERIC_READ blocks stat operations
+// (READ_CONTROL is part of its expansion), which POSIX read-deny does not imply.
+ACCESS_MASK to_deny_mask(uint32_t rwx)
+{
+    ACCESS_MASK mask = 0;
+    if (rwx & 4)
+        mask |= FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES;
+    if (rwx & 2)
+        mask |= FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_APPEND_DATA;
+    if (rwx & 1)
+        mask |= FILE_EXECUTE;
+    return mask;
+}
+
+std::vector<BYTE> make_sid(WELL_KNOWN_SID_TYPE type)
+{
+    DWORD size = SECURITY_MAX_SID_SIZE;
+    std::vector<BYTE> sid(size);
+    if (!CreateWellKnownSid(type, nullptr, sid.data(), &size))
+        return {};
+    return sid;
+}
+
+std::vector<BYTE> copy_sid(PSID src)
+{
+    if (!src || !IsValidSid(src))
+        return {};
+    DWORD len = GetLengthSid(src);
+    std::vector<BYTE> sid(len);
+    if (!CopySid(len, sid.data(), src))
+        return {};
+    return sid;
+}
+
+// Builds a new SID by replacing the RID. Only genuine account SIDs (S-1-5-21-…)
+// are eligible: rewriting the last sub-authority of a short well-known SID can
+// transmute it into another principal — CREATOR OWNER (S-1-3-0) with rid 1
+// becomes CREATOR GROUP (S-1-3-1), the group placeholder. The guard guarantees
+// the result can never collide with that placeholder.
+std::vector<BYTE> sid_with_rid(PSID existing, uint32_t new_rid)
+{
+    if (!existing || !IsValidSid(existing))
+        return {};
+
+    PSID_IDENTIFIER_AUTHORITY auth = GetSidIdentifierAuthority(existing);
+    PUCHAR count = GetSidSubAuthorityCount(existing);
+    const bool is_nt_account = auth && auth->Value[5] == 5 /* SECURITY_NT_AUTHORITY */ && count &&
+                             *count >= 2 && *GetSidSubAuthority(existing, 0) == 21 /* NON_UNIQUE */;
+    if (!is_nt_account)
+        return {};
+
+    DWORD len = GetLengthSid(existing);
+    std::vector<BYTE> sid(len);
+    if (!CopySid(len, sid.data(), existing))
+        return {};
+    *GetSidSubAuthority(sid.data(), *count - 1) = static_cast<DWORD>(new_rid);
+    return sid;
+}
+
+// Returns a copy of pDACL with inherited ACEs removed.
+// buf must outlive the returned pointer — it owns the memory.
+PACL strip_inherited_aces(PACL pDACL, std::vector<BYTE>& buf)
+{
+    if (!pDACL)
+        return nullptr;
+
+    ACL_SIZE_INFORMATION info{};
+    if (!GetAclInformation(pDACL, &info, sizeof(info), AclSizeInformation))
+        return nullptr;
+
+    // Original size is a safe upper bound for the filtered copy
+    buf.resize(pDACL->AclSize);
+    auto* pNew = reinterpret_cast<PACL>(buf.data());
+    if (!InitializeAcl(pNew, static_cast<DWORD>(buf.size()), ACL_REVISION))
+        return nullptr;
+
+    for (DWORD i = 0; i < info.AceCount; ++i)
+    {
+        void* pAce = nullptr;
+        if (!GetAce(pDACL, i, &pAce))
+            continue;
+        if (static_cast<ACE_HEADER*>(pAce)->AceFlags & INHERITED_ACE)
+            continue; // leave inherited ACEs to be re-evaluated from parent
+        if (!AddAce(pNew, ACL_REVISION, MAXDWORD, pAce, static_cast<ACE_HEADER*>(pAce)->AceSize))
+            return nullptr;
+    }
+    return pNew;
+}
+
+bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
+{
+    PACL pDACL = nullptr;
+    PSID pOwnerSID = nullptr;
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+
+    if (GetSecurityInfo(handle,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                        &pOwnerSID,
+                        nullptr,
+                        &pDACL,
+                        nullptr,
+                        &pSD) != ERROR_SUCCESS)
+        return false;
+    auto sd_guard = std::unique_ptr<void, decltype(&LocalFree)>(pSD, LocalFree);
+
+    // uid/gid round-trip is not implemented yet -> POSIX nobody/nogroup. When
+    // implemented this becomes sid_to_rid(pOwnerSID) / group RID, and the
+    // ownership-applying branch in set_posix_security must be enabled with it.
+    attr.uid = -2;
+    attr.gid = -2;
+
+    if (!pDACL)
+        return true; // no DACL: leave permission bits untouched
+
+    // Read the explicit-ACE view, exactly as the write path builds its DACL from
+    // an explicit-only base. On strip failure, fail to the same "no usable DACL"
+    // behaviour rather than silently switching to the inherited view.
+    std::vector<BYTE> filtered_buf;
+    PACL pEffectiveDACL = strip_inherited_aces(pDACL, filtered_buf);
+    if (!pEffectiveDACL)
+        return true;
+
+    struct SidEntry
+    {
+        uint32_t read, write, exec;
+        ACCESS_MASK allow{0}, deny{0};
+        std::vector<BYTE> sid;
+    };
+
+    // Priority owner > group > others. Each ACE is attributed to the FIRST
+    // matching entry only (a missing break here produced the 0224 bug). With
+    // owner first, any SID that ever collided with the group placeholder would
+    // resolve to the more specific principal deterministically.
+    std::array<SidEntry, 3> entries{{
+        {static_cast<uint32_t>(fs::perms::owner_read),
+         static_cast<uint32_t>(fs::perms::owner_write),
+         static_cast<uint32_t>(fs::perms::owner_exec),
+         0,
+         0,
+         copy_sid(pOwnerSID)},
+        {static_cast<uint32_t>(fs::perms::group_read),
+         static_cast<uint32_t>(fs::perms::group_write),
+         static_cast<uint32_t>(fs::perms::group_exec),
+         0,
+         0,
+         make_sid(WinCreatorGroupSid)}, // literal S-1-3-1, matches write
+        {static_cast<uint32_t>(fs::perms::others_read),
+         static_cast<uint32_t>(fs::perms::others_write),
+         static_cast<uint32_t>(fs::perms::others_exec),
+         0,
+         0,
+         make_sid(WinWorldSid)},
+    }};
+
+    auto& group_entry = entries[1];
+    auto& others_entry = entries[2];
+
+    ACL_SIZE_INFORMATION acl_info{};
+    if (!GetAclInformation(pEffectiveDACL, &acl_info, sizeof(acl_info), AclSizeInformation))
+        return false;
+
+    for (DWORD i = 0; i < acl_info.AceCount; ++i)
+    {
+        void* pAce = nullptr;
+        if (!GetAce(pEffectiveDACL, i, &pAce))
+            continue;
+        const auto ace_type = static_cast<ACE_HEADER*>(pAce)->AceType;
+        if (ace_type != ACCESS_ALLOWED_ACE_TYPE && ace_type != ACCESS_DENIED_ACE_TYPE)
+            continue;
+
+        auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(pAce);
+        PSID ace_sid = reinterpret_cast<PSID>(&ace->SidStart);
+
+        for (auto& e : entries)
+        {
+            if (e.sid.empty() || !EqualSid(ace_sid, reinterpret_cast<PSID>(e.sid.data())))
+                continue;
+            if (ace_type == ACCESS_ALLOWED_ACE_TYPE)
+                e.allow |= ace->Mask;
+            else
+                e.deny |= ace->Mask;
+            break; // attribute to exactly one entry, most specific by order
+        }
+    }
+
+    // Files not written by set_posix_security carry no group placeholder ACE;
+    // derive group from others for such foreign files. Our own files always have
+    // an explicit group ACE unless group==0 && others==0, in which case others is
+    // also 0 and this yields the correct 0 — so our round-trip is never corrupted.
+    // (A reappearing group==others on OUR files would signal the placeholder went
+    // missing again, e.g. an inheritable ACE crept back in.)
+    if (group_entry.allow == 0 && group_entry.deny == 0)
+    {
+        group_entry.allow = others_entry.allow;
+        group_entry.deny = others_entry.deny;
+    }
+
+    // Only data bits matter; MIN_MANAGEMENT_RIGHTS / standard rights carry none
+    // of FILE_READ_DATA / FILE_WRITE_DATA / FILE_EXECUTE, so they're invisible here.
+    auto mask_to_posix = [](ACCESS_MASK mask, uint32_t r, uint32_t w, uint32_t x) {
+        uint32_t result = static_cast<uint32_t>(fs::perms::none);
+        if (mask & FILE_READ_DATA)
+            result |= r;
+        if (mask & FILE_WRITE_DATA)
+            result |= w;
+        if (mask & FILE_EXECUTE)
+            result |= x;
+        return result;
+    };
+
+    uint32_t perms = static_cast<uint32_t>(fs::perms::none);
+    for (const auto& e : entries)
+        perms |= mask_to_posix(e.allow & ~e.deny, e.read, e.write, e.exec);
+
+    attr.permissions |= perms;
+    return true;
+}
+
+bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
+{
+    // Only permission bits are implemented. uid/gid are deliberately ignored so
+    // set/get stay symmetric: get always reports uid/gid == -2, so changing
+    // ownership would be invisible on read-back.
+    if (!posix_security.perms)
+        return true;
+
+    PACL pOldDACL = nullptr;
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    PSID pOwner = nullptr;
+
+    if (GetSecurityInfo(handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &pOwner,
+                        nullptr,
+                        &pOldDACL,
+                        nullptr,
+                        &pSD) != ERROR_SUCCESS)
+        return false;
+    auto sd_guard = std::unique_ptr<void, decltype(&LocalFree)>(pSD, LocalFree);
+
+    // Owner ACEs use the file's existing owner SID; ownership is not changed.
+    std::vector<BYTE> owner_sid = copy_sid(pOwner);
+    if (owner_sid.empty())
+        return false;
+
+    const uint32_t perms_val = *posix_security.perms;
+    const uint32_t owner_bits = (perms_val >> 6) & 0x7;
+    const uint32_t group_bits = (perms_val >> 3) & 0x7;
+    const uint32_t others_bits = perms_val & 0x7;
+
+    // POSIX precedence: a more-specific class DENIES what a broader class grants
+    // but it shouldn't have.
+    const uint32_t group_deny_bits = others_bits & ~group_bits;
+    const uint32_t owner_deny_bits = (others_bits | group_bits) & ~owner_bits;
+
+    std::vector<EXPLICIT_ACCESS> ea;
+    ea.reserve(9);
+
+    // No inheritance anywhere. This keeps the CREATOR GROUP placeholder (S-1-3-1)
+    // a literal trustee: an inheritable placeholder would be substituted to the
+    // file's primary group SID when it became effective, which (a) breaks the
+    // read-back keyed on S-1-3-1 and (b) fuses owner and group bits whenever
+    // owner == group. Non-inheritable ACEs also match POSIX, which sets mode
+    // explicitly at create time rather than propagating bits from the parent.
+    auto add_ea = [&](const std::vector<BYTE>& sid, ACCESS_MODE mode, ACCESS_MASK mask) {
+        if (sid.empty())
+            return;
+        EXPLICIT_ACCESS e{};
+        e.grfAccessPermissions = mask;
+        e.grfAccessMode = mode;
+        e.grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSid(&e.Trustee, reinterpret_cast<PSID>(const_cast<BYTE*>(sid.data())));
+        ea.push_back(e);
+    };
+
+    auto apply_posix_rights = [&](const std::vector<BYTE>& sid,
+                                  uint32_t allow_bits,
+                                  uint32_t deny_bits,
+                                  bool is_owner = false) {
+        if (sid.empty())
+            return;
+        add_ea(sid, REVOKE_ACCESS, 0);
+        if (deny_bits)
+            add_ea(sid, DENY_ACCESS, to_deny_mask(deny_bits));
+        // Owner keeps MIN_MANAGEMENT_RIGHTS so they retain SD control after
+        // chmod 000; these carry no data bits, so they're invisible to read-back.
+        const ACCESS_MASK min_rights = is_owner ? MIN_MANAGEMENT_RIGHTS : 0;
+        const ACCESS_MASK allow_mask = allow_bits ? (to_allow_mask(allow_bits) | min_rights)
+                                                  : min_rights;
+        if (allow_mask)
+            add_ea(sid, GRANT_ACCESS, allow_mask);
+    };
+
+    auto world_sid = make_sid(WinWorldSid);
+    auto group_sid = make_sid(WinCreatorGroupSid);
+    auto admin_sid = make_sid(WinBuiltinAdministratorsSid);
+    if (world_sid.empty() || group_sid.empty() || admin_sid.empty())
+        return false;
+
+    apply_posix_rights(world_sid, others_bits, 0);
+    apply_posix_rights(group_sid, group_bits, group_deny_bits);
+    apply_posix_rights(owner_sid, owner_bits, owner_deny_bits, true);
+
+    // Safety net: admins keep SD read/write even if WinWorldSid carries a DENY
+    // that would otherwise lock them out. No data bits -> invisible to read-back.
+    add_ea(admin_sid, SET_ACCESS, MIN_MANAGEMENT_RIGHTS);
+
+    // Strip inherited ACEs from the base so our explicit POSIX set is the only
+    // thing driving the result, symmetric with the read path which reads only
+    // the explicit view.
+    std::vector<BYTE> filtered_buf;
+    PACL pBaseDACL = strip_inherited_aces(pOldDACL, filtered_buf);
+
+    PACL pNewDACL = nullptr;
+    if (SetEntriesInAcl(static_cast<ULONG>(ea.size()), ea.data(), pBaseDACL, &pNewDACL) !=
+        ERROR_SUCCESS)
+        return false;
+    std::unique_ptr<ACL, decltype(&LocalFree)> acl_guard(pNewDACL, LocalFree);
+
+    return SetSecurityInfo(handle,
+                           SE_FILE_OBJECT,
+                           DACL_SECURITY_INFORMATION,
+                           nullptr,
+                           nullptr,
+                           pNewDACL,
+                           nullptr) == ERROR_SUCCESS;
 }
 
 sftp_attributes_struct stat_to_attr(const struct _stat64& file_data)
@@ -173,9 +535,6 @@ sftp_attributes_struct stat_to_attr(const BY_HANDLE_FILE_INFORMATION& file_data,
     attr.atime = time_t_from(&(file_data.ftLastAccessTime));
     attr.mtime = time_t_from(&(file_data.ftLastWriteTime));
 
-    attr.permissions =
-        static_cast<uint32_t>(fs::perms::all & ~(fs::perms::group_write | fs::perms::others_write));
-
     if (file_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
     {
         FILE_ATTRIBUTE_TAG_INFO tagInfo{};
@@ -186,32 +545,18 @@ sftp_attributes_struct stat_to_attr(const BY_HANDLE_FILE_INFORMATION& file_data,
             (tagInfo.ReparseTag == IO_REPARSE_TAG_SYMLINK ||
              tagInfo.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT))
         {
-            // TODO: Windows prepends the extended path prefix "\\?\", which we
-            // may want to strip in the total count
             attr.size = GetFinalPathNameByHandleA(file_handle, NULL, 0, VOLUME_NAME_DOS);
+            // Strip prefix "\\?\"
             if (attr.size >= 4)
                 attr.size -= 4;
-            attr.permissions |= static_cast<uint32_t>(
-                fs::perms::group_write | fs::perms::others_write); // Symlinks have 0777 by default
-            attr.permissions |= SSH_S_IFLNK;
+            attr.permissions |= SSH_S_IFLNK | static_cast<uint32_t>(fs::perms::all); // Windows does
+            // not enforce symlink ACLs
         }
     }
     else if (file_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-    {
         attr.permissions |= SSH_S_IFDIR; // Directories are 0755 by default
-        if (file_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
-        {
-            attr.permissions &= ~static_cast<uint32_t>(fs::perms::owner_write);
-        }
-    }
     else
-    {
         attr.permissions |= SSH_S_IFREG; // Files 0755 by default
-        if (file_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
-        {
-            attr.permissions &= ~static_cast<uint32_t>(fs::perms::owner_write);
-        }
-    }
 
     return attr;
 }
@@ -1163,47 +1508,51 @@ bool mp::platform::Platform::set_permissions(const std::filesystem::path& path,
                                              std::filesystem::perms permissions,
                                              bool inherit) const
 {
-    // Windows has both ACLs and very limited POSIX permissions
 
-    // This handles the POSIX side of things.
-    std::error_code ec{};
-    std::filesystem::permissions(path, permissions, ec);
+    HANDLE file_handle = CreateFileA(path.string().c_str(),
+                                     READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     NULL,
+                                     OPEN_EXISTING,
+                                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                     NULL);
 
-    // Rest handles ACLs
-    auto perms{static_cast<uint32_t>(permissions)};
-    auto path_str = path.string();
-    LPSTR lpPath = const_cast<LPSTR>(path_str.c_str()); // Guaranteed null terminated string
-    auto success = true;
+    if (file_handle == INVALID_HANDLE_VALUE)
+    {
+        DWORD win_err = GetLastError();
+        switch (win_err)
+        {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_NAME:
+        case ERROR_BAD_NETPATH:
+        case ERROR_BAD_PATHNAME:
+            errno = ENOENT;
+            break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+            errno = EACCES;
+            break;
+        case ERROR_OUTOFMEMORY:
+            errno = ENOMEM;
+            break;
+        case ERROR_INVALID_PARAMETER:
+            errno = EINVAL;
+            break;
+        case ERROR_TOO_MANY_OPEN_FILES:
+            errno = EMFILE;
+            break;
+        default:
+            errno = EPERM;
+            break;
+        }
+        return false;
+    }
 
-    auto newACL = new_ACL(lpPath);
-
-    // Wipe out current ACLs
-    SetNamedSecurityInfo(lpPath,
-                         SE_FILE_OBJECT,
-                         DACL_SECURITY_INFORMATION,
-                         nullptr,
-                         nullptr,
-                         newACL.get(),
-                         nullptr);
-
-    if (uint32_t others = perms & static_cast<uint32_t>(fs::perms::others_all); others != 0)
-        success &= set_specific_perms(lpPath, WinWorldSid, convert_permissions(others), inherit) ==
-                   ERROR_SUCCESS;
-    if (uint32_t group = perms & static_cast<uint32_t>(fs::perms::group_all); group != 0)
-        success &=
-            set_specific_perms(lpPath, WinCreatorGroupSid, convert_permissions(group), inherit) ==
-            ERROR_SUCCESS;
-    if (uint32_t owner = perms & static_cast<uint32_t>(fs::perms::owner_all); owner != 0)
-        success &=
-            set_specific_perms(lpPath, WinCreatorOwnerSid, convert_permissions(owner), inherit) ==
-            ERROR_SUCCESS;
-
-    // #3216 Set the owner as Admin and give the Admins group blanket access
-    success &= take_ownership(path);
-    success &= set_specific_perms(lpPath, WinBuiltinAdministratorsSid, GENERIC_ALL, inherit) ==
-               ERROR_SUCCESS;
-
-    return success;
+    const PosixSecurity perms{static_cast<uint32_t>(permissions), std::nullopt, std::nullopt};
+    const bool ok = set_posix_security(file_handle, perms);
+    CloseHandle(file_handle);
+    return ok;
 }
 
 bool mp::platform::Platform::take_ownership(const std::filesystem::path& path) const
@@ -1363,14 +1712,13 @@ QString mp::platform::Platform::multipass_storage_location() const
 
 int mp::platform::Platform::lstat_attr_from(const char* path, sftp_attributes_struct& attr) const
 {
-    HANDLE file_handle =
-        CreateFileA(path,
-                    0, // 0 access rights is enough to query metadata without read/write locks
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    NULL,
-                    OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                    NULL);
+    HANDLE file_handle = CreateFileA(path,
+                                     READ_CONTROL,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     NULL,
+                                     OPEN_EXISTING,
+                                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                     NULL);
     if (file_handle != INVALID_HANDLE_VALUE)
     {
         BY_HANDLE_FILE_INFORMATION file_info;
@@ -1379,6 +1727,7 @@ int mp::platform::Platform::lstat_attr_from(const char* path, sftp_attributes_st
         // 0 signals failure
         {
             attr = stat_to_attr(file_info, file_handle);
+            get_posix_security(file_handle, attr);
 
             CloseHandle(file_handle);
             return 0;
@@ -1425,14 +1774,13 @@ int mp::platform::Platform::lstat_attr_from(const char* path, sftp_attributes_st
 
 int mp::platform::Platform::stat_attr_from(const char* path, sftp_attributes_struct& attr) const
 {
-    HANDLE file_handle =
-        CreateFileA(path,
-                    0, // 0 access rights is enough to query metadata without read/write locks
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    NULL,
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    NULL);
+    HANDLE file_handle = CreateFileA(path,
+                                     READ_CONTROL,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     NULL,
+                                     OPEN_EXISTING,
+                                     FILE_FLAG_BACKUP_SEMANTICS,
+                                     NULL);
     if (file_handle != INVALID_HANDLE_VALUE)
     {
         BY_HANDLE_FILE_INFORMATION file_info;
@@ -1441,6 +1789,7 @@ int mp::platform::Platform::stat_attr_from(const char* path, sftp_attributes_str
         // 0 signals failure
         {
             attr = stat_to_attr(file_info, file_handle);
+            get_posix_security(file_handle, attr);
 
             CloseHandle(file_handle);
             return 0;

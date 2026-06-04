@@ -303,37 +303,6 @@ enum class Permission
     Group,
     Other
 };
-bool compare_permission(uint32_t ssh_permissions, const QFileInfo& file, Permission perm_type)
-{
-    uint16_t qt_perm_mask{0u}, ssh_perm_mask{0u}, qt_bitshift{0u}, ssh_bitshift{0u};
-
-    // Comparing file permissions, sftp uses octal format: (aaabbbccc), QFileInfo uses hex format
-    // (aaaa----bbbbcccc)
-    switch (perm_type)
-    {
-    case Permission::Owner:
-        qt_perm_mask = 0x7000;
-        qt_bitshift = 12;
-        ssh_perm_mask = 0700;
-        ssh_bitshift = 6;
-        break;
-    case Permission::Group:
-        qt_perm_mask = 0x70;
-        qt_bitshift = 4;
-        ssh_perm_mask = 070;
-        ssh_bitshift = 3;
-        break;
-    case Permission::Other:
-        qt_perm_mask = 0x7;
-        qt_bitshift = 0;
-        ssh_perm_mask = 07;
-        ssh_bitshift = 0;
-        break;
-    }
-
-    return ((ssh_permissions & ssh_perm_mask) >> ssh_bitshift) ==
-           ((static_cast<uint32_t>(file.permissions()) & qt_perm_mask) >> qt_bitshift);
-}
 } // namespace
 
 TEST_F(SftpServer, throwsWhenMessageNull)
