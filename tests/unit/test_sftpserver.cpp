@@ -652,7 +652,7 @@ TEST_F(SftpServer, handlesMkdir)
 
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject();
 
-    EXPECT_CALL(*platform, set_permissions(A<const std::filesystem::path&>(), _, _))
+    EXPECT_CALL(*platform, set_permissions_sftp(A<const std::filesystem::path&>(), _))
         .WillOnce(Return(true));
     EXPECT_CALL(*platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
@@ -715,7 +715,7 @@ TEST_F(SftpServer, mkdirSetPermissionsFails)
     auto new_dir_name = name_as_char_array(new_dir);
 
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject();
-    EXPECT_CALL(*platform, set_permissions(_, _, _)).WillOnce(Return(false));
+    EXPECT_CALL(*platform, set_permissions_sftp(_, _)).WillOnce(Return(false));
     EXPECT_CALL(*platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -756,7 +756,7 @@ TEST_F(SftpServer, mkdirChownFailureFails)
     const auto [mock_platform, guard] = mpt::MockPlatform::inject();
 
     EXPECT_CALL(*mock_platform, chown(_, _, _)).WillOnce(Return(-1));
-    EXPECT_CALL(*mock_platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*mock_platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*mock_platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -1738,7 +1738,7 @@ TEST_F(SftpServer, openChownFailureFails)
 TEST_F(SftpServer, openNoHandleAllocatedFails)
 {
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject<NiceMock>();
-    EXPECT_CALL(*platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*platform, stat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -1924,7 +1924,7 @@ TEST_F(SftpServer, handlesReaddirAttributesPreserved)
 
     fs::perms expected_permissions = fs::perms::owner_write | fs::perms::group_exec |
                                      fs::perms::others_read;
-    MP_PLATFORM.set_permissions(test_file.toStdString(), expected_permissions);
+    MP_PLATFORM.set_permissions_sftp(test_file.toStdString(), expected_permissions);
 
     auto init_msg = make_msg(SSH_FXP_INIT);
     auto opendir_msg = make_msg(SFTP_OPENDIR);
@@ -2107,7 +2107,7 @@ TEST_F(SftpServer, handlesFsetstat)
     auto reply_status = make_reply_status(fsetstat_msg.get(), SSH_FX_OK, num_calls);
 
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject<NiceMock>();
-    EXPECT_CALL(*platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -2159,7 +2159,7 @@ TEST_F(SftpServer, handlesSetstat)
     auto reply_status = make_reply_status(msg.get(), SSH_FX_OK, num_calls);
 
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject<NiceMock>();
-    EXPECT_CALL(*platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*platform, stat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -2286,7 +2286,7 @@ TEST_F(SftpServer, setstatSetPermissionsFailureFails)
     const auto [file_ops, mock_file_ops_guard] = mpt::MockFileOps::inject();
     const auto [platform, mock_platform_guard] = mpt::MockPlatform::inject();
     EXPECT_CALL(*file_ops, resize(A<const fs::path&>(), _, _)).WillOnce(Return());
-    EXPECT_CALL(*platform, set_permissions(_, _, _)).WillOnce(Return(false));
+    EXPECT_CALL(*platform, set_permissions_sftp(_, _)).WillOnce(Return(false));
     EXPECT_CALL(*file_ops, exists(A<const fs::path&>())).WillRepeatedly([](const fs::path& file) {
         return fs::exists(file);
     });
@@ -3562,7 +3562,7 @@ TEST_F(SftpServer, DISABLE_ON_WINDOWS(mkdirChownHonorsMapsInTheHost))
 
     EXPECT_CALL(*mock_platform, chown(_, host_uid, host_gid)).Times(1);
     EXPECT_CALL(*mock_platform, chown(_, sftp_uid, sftp_gid)).Times(0);
-    EXPECT_CALL(*mock_platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*mock_platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*mock_platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;
@@ -3595,7 +3595,7 @@ TEST_F(SftpServer, DISABLE_ON_WINDOWS(mkdirChownWorksWhenIdsAreNotMapped))
     QFileInfo parent_dir(temp_dir.path());
 
     EXPECT_CALL(*mock_platform, chown(_, parent_dir.ownerId(), parent_dir.groupId())).Times(1);
-    EXPECT_CALL(*mock_platform, set_permissions(_, _, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*mock_platform, set_permissions_sftp(_, _)).WillRepeatedly(Return(true));
     EXPECT_CALL(*mock_platform, lstat_attr_from(_, _))
         .WillOnce([](const char*, sftp_attributes_struct& attr) {
             attr.uid = default_uid;

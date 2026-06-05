@@ -76,6 +76,8 @@ public:
     virtual bool set_permissions(const std::filesystem::path& path,
                                  std::filesystem::perms permissions,
                                  bool try_inherit = false) const;
+    virtual bool set_permissions_sftp(const std::filesystem::path& path,
+                                      std::filesystem::perms permissions) const;
     virtual bool take_ownership(const std::filesystem::path& path) const;
     virtual void setup_permission_inheritance(bool restricted = true) const;
     virtual bool link(const char* target, const char* link) const;
