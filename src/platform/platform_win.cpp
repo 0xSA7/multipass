@@ -106,7 +106,8 @@ static constexpr ACCESS_MASK MIN_MANAGEMENT_RIGHTS =
     WRITE_OWNER |          // change owner
     DELETE |               // delete file
     FILE_READ_ATTRIBUTES | // stat without data access
-    SYNCHRONIZE;           // required to open any handle
+    FILE_WRITE_ATTRIBUTES | FILE_READ_EA | FILE_WRITE_EA |
+    SYNCHRONIZE; // required to open any handle
 
 struct PosixSecurity
 {
@@ -114,6 +115,46 @@ struct PosixSecurity
     std::optional<uint32_t> uid;
     std::optional<uint32_t> gid;
 };
+
+// FILE_FULL_EA_INFORMATION / FILE_GET_EA_INFORMATION live in ntifs.h (DDK), not
+// the user-mode SDK. Declared here with the documented packed layout under
+// distinct names so there's no clash if ntifs.h is ever pulled in.
+#pragma pack(push, 1)
+struct EaFull
+{
+    ULONG NextEntryOffset;
+    UCHAR Flags;
+    UCHAR EaNameLength; // excludes the null terminator
+    USHORT EaValueLength;
+    CHAR EaName[1]; // name, null terminator, then value
+};
+struct EaGet
+{
+    ULONG NextEntryOffset;
+    UCHAR EaNameLength; // excludes the null terminator
+    CHAR EaName[1];
+};
+
+// Our metadata blob. `present` records which POSIX fields were actually set, so
+// a partial set (e.g. chown-only) never fabricates a mode=0 that get_ would read
+// back as 000. magic/version let future formats be detected and ignored cleanly.
+struct PosixEa
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t present; // bitmask: MODE | UID | GID
+    uint32_t mode;    // POSIX permission bits
+    uint32_t uid;
+    uint32_t gid;
+};
+#pragma pack(pop)
+
+constexpr char kEaName[] = "$POSIX";      // NTFS stores EA names uppercased
+constexpr uint32_t kEaMagic = 0x49584F50; // 'POXI'
+constexpr uint16_t kEaVersion = 1;
+constexpr uint16_t POSIX_EA_MODE = 1u << 0;
+constexpr uint16_t POSIX_EA_UID = 1u << 1;
+constexpr uint16_t POSIX_EA_GID = 1u << 2;
 
 time_t time_t_from(const FILETIME* ft)
 {
@@ -159,7 +200,7 @@ ACCESS_MASK to_deny_mask(uint32_t rwx)
 {
     ACCESS_MASK mask = 0;
     if (rwx & 4)
-        mask |= FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES;
+        mask |= FILE_READ_DATA;
     if (rwx & 2)
         mask |= FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_APPEND_DATA;
     if (rwx & 1)
@@ -242,8 +283,118 @@ PACL strip_inherited_aces(PACL pDACL, std::vector<BYTE>& buf)
     return pNew;
 }
 
+inline bool nt_ok(NTSTATUS s)
+{
+    return s >= 0;
+}
+
+using NtSetEaFile_t = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG);
+using NtQueryEaFile_t = NTSTATUS(
+    NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, BOOLEAN, PVOID, ULONG, PULONG, BOOLEAN);
+
+NtSetEaFile_t nt_set_ea()
+{
+    static auto fn = reinterpret_cast<NtSetEaFile_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetEaFile"));
+    return fn;
+}
+NtQueryEaFile_t nt_query_ea()
+{
+    static auto fn = reinterpret_cast<NtQueryEaFile_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryEaFile"));
+    return fn;
+}
+
+// Requires the handle to have been opened with FILE_WRITE_EA.
+bool write_posix_ea(HANDLE handle, const PosixEa& meta)
+{
+    auto fn = nt_set_ea();
+    if (!fn)
+        return false;
+
+    constexpr UCHAR name_len = sizeof(kEaName) - 1; // 6, no null
+    constexpr USHORT value_len = sizeof(PosixEa);
+    constexpr size_t header = offsetof(EaFull, EaName);
+    const size_t total = header + name_len + 1 + value_len; // +1 = name's null
+
+    std::vector<BYTE> buf(total, 0);
+    auto* ea = reinterpret_cast<EaFull*>(buf.data());
+    ea->NextEntryOffset = 0;
+    ea->Flags = 0;
+    ea->EaNameLength = name_len;
+    ea->EaValueLength = value_len;
+    std::memcpy(buf.data() + header, kEaName, name_len); // null slot already 0
+    std::memcpy(buf.data() + header + name_len + 1, &meta, value_len);
+
+    IO_STATUS_BLOCK iosb{};
+    return nt_ok(fn(handle, &iosb, buf.data(), static_cast<ULONG>(total)));
+}
+
+// Requires the handle to have been opened with FILE_READ_EA. Returns false when
+// the EA is absent, unreadable, or not our format (caller falls back to the ACL).
+bool read_posix_ea(HANDLE handle, PosixEa& out)
+{
+    auto fn = nt_query_ea();
+    if (!fn)
+        return false;
+
+    // GET list naming our single EA.
+    constexpr UCHAR name_len = sizeof(kEaName) - 1;
+    constexpr size_t get_header = offsetof(EaGet, EaName);
+    const size_t get_total = get_header + name_len + 1;
+    std::vector<BYTE> get_buf(get_total, 0);
+    auto* g = reinterpret_cast<EaGet*>(get_buf.data());
+    g->NextEntryOffset = 0;
+    g->EaNameLength = name_len;
+    std::memcpy(get_buf.data() + get_header, kEaName, name_len);
+
+    std::vector<BYTE> out_buf(512, 0);
+    IO_STATUS_BLOCK iosb{};
+    NTSTATUS st = fn(handle,
+                     &iosb,
+                     out_buf.data(),
+                     static_cast<ULONG>(out_buf.size()),
+                     TRUE, // ReturnSingleEntry
+                     get_buf.data(),
+                     static_cast<ULONG>(get_total),
+                     nullptr, // EaIndex
+                     TRUE);   // RestartScan
+    if (!nt_ok(st))
+        return false; // STATUS_NO_EAS_ON_FILE / NONEXISTENT_EA_ENTRY land here
+
+    auto* ea = reinterpret_cast<EaFull*>(out_buf.data());
+    if (ea->EaValueLength != sizeof(PosixEa))
+        return false;
+    PosixEa meta{};
+    std::memcpy(&meta,
+                out_buf.data() + offsetof(EaFull, EaName) + ea->EaNameLength + 1,
+                sizeof(PosixEa));
+    if (meta.magic != kEaMagic || meta.version != kEaVersion)
+        return false;
+
+    out = meta;
+    return true;
+}
+
 bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
 {
+    // uid/gid retrieval is intentionally not wired up yet -> POSIX nobody/nogroup,
+    // even though set_ now stores them in the EA. When enabled, read meta.uid/gid
+    // here (guarded by the present bits) instead of the constants below.
+    attr.uid = -2;
+    attr.gid = -2;
+
+    // Source of truth: the POSIX mode stored verbatim in our EA. This round-trips
+    // exactly and sidesteps the entire lossy ACL->mode projection.
+    PosixEa meta{};
+    if (read_posix_ea(handle, meta) && (meta.present & POSIX_EA_MODE))
+    {
+        attr.permissions |= meta.mode;
+        return true;
+    }
+
+    // Fallback for files we didn't write (no EA, or a volume without EA support):
+    // derive a best-effort mode from the explicit DACL, as before.
     PACL pDACL = nullptr;
     PSID pOwnerSID = nullptr;
     PSECURITY_DESCRIPTOR pSD = nullptr;
@@ -259,18 +410,9 @@ bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
         return false;
     auto sd_guard = std::unique_ptr<void, decltype(&LocalFree)>(pSD, LocalFree);
 
-    // uid/gid round-trip is not implemented yet -> POSIX nobody/nogroup. When
-    // implemented this becomes sid_to_rid(pOwnerSID) / group RID, and the
-    // ownership-applying branch in set_posix_security must be enabled with it.
-    attr.uid = -2;
-    attr.gid = -2;
-
     if (!pDACL)
-        return true; // no DACL: leave permission bits untouched
+        return true;
 
-    // Read the explicit-ACE view, exactly as the write path builds its DACL from
-    // an explicit-only base. On strip failure, fail to the same "no usable DACL"
-    // behaviour rather than silently switching to the inherited view.
     std::vector<BYTE> filtered_buf;
     PACL pEffectiveDACL = strip_inherited_aces(pDACL, filtered_buf);
     if (!pEffectiveDACL)
@@ -283,10 +425,6 @@ bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
         std::vector<BYTE> sid;
     };
 
-    // Priority owner > group > others. Each ACE is attributed to the FIRST
-    // matching entry only (a missing break here produced the 0224 bug). With
-    // owner first, any SID that ever collided with the group placeholder would
-    // resolve to the more specific principal deterministically.
     std::array<SidEntry, 3> entries{{
         {static_cast<uint32_t>(fs::perms::owner_read),
          static_cast<uint32_t>(fs::perms::owner_write),
@@ -299,7 +437,7 @@ bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
          static_cast<uint32_t>(fs::perms::group_exec),
          0,
          0,
-         make_sid(WinCreatorGroupSid)}, // literal S-1-3-1, matches write
+         make_sid(WinNullSid)}, // matches the best-effort ACL placeholder
         {static_cast<uint32_t>(fs::perms::others_read),
          static_cast<uint32_t>(fs::perms::others_write),
          static_cast<uint32_t>(fs::perms::others_exec),
@@ -335,24 +473,16 @@ bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
                 e.allow |= ace->Mask;
             else
                 e.deny |= ace->Mask;
-            break; // attribute to exactly one entry, most specific by order
+            break;
         }
     }
 
-    // Files not written by set_posix_security carry no group placeholder ACE;
-    // derive group from others for such foreign files. Our own files always have
-    // an explicit group ACE unless group==0 && others==0, in which case others is
-    // also 0 and this yields the correct 0 — so our round-trip is never corrupted.
-    // (A reappearing group==others on OUR files would signal the placeholder went
-    // missing again, e.g. an inheritable ACE crept back in.)
     if (group_entry.allow == 0 && group_entry.deny == 0)
     {
         group_entry.allow = others_entry.allow;
         group_entry.deny = others_entry.deny;
     }
 
-    // Only data bits matter; MIN_MANAGEMENT_RIGHTS / standard rights carry none
-    // of FILE_READ_DATA / FILE_WRITE_DATA / FILE_EXECUTE, so they're invisible here.
     auto mask_to_posix = [](ACCESS_MASK mask, uint32_t r, uint32_t w, uint32_t x) {
         uint32_t result = static_cast<uint32_t>(fs::perms::none);
         if (mask & FILE_READ_DATA)
@@ -374,9 +504,47 @@ bool get_posix_security(HANDLE handle, sftp_attributes_struct& attr)
 
 bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
 {
-    // Only permission bits are implemented. uid/gid are deliberately ignored so
-    // set/get stay symmetric: get always reports uid/gid == -2, so changing
-    // ownership would be invisible on read-back.
+    if (!posix_security.perms && !posix_security.uid && !posix_security.gid)
+        return true;
+
+    // --- Authoritative metadata: read-modify-write the EA ---------------------
+    // Start from the existing EA so a chown doesn't clobber the stored mode and a
+    // chmod doesn't clobber stored ids. Defaults keep uid/gid at the -2 sentinel.
+    PosixEa meta{};
+    if (!read_posix_ea(handle, meta))
+    {
+        meta.magic = kEaMagic;
+        meta.version = kEaVersion;
+        meta.present = 0;
+        meta.mode = 0;
+        meta.uid = static_cast<uint32_t>(-2);
+        meta.gid = static_cast<uint32_t>(-2);
+    }
+    if (posix_security.perms)
+    {
+        meta.mode = *posix_security.perms;
+        meta.present |= POSIX_EA_MODE;
+    }
+    if (posix_security.uid)
+    {
+        meta.uid = *posix_security.uid;
+        meta.present |= POSIX_EA_UID;
+    }
+    if (posix_security.gid)
+    {
+        meta.gid = *posix_security.gid;
+        meta.present |= POSIX_EA_GID;
+    }
+
+    // EA is the source of truth in this design; if the volume can't store it
+    // (FAT/exFAT, EA-stripping redirector) the round-trip guarantee is gone, so
+    // surface that as failure rather than silently dropping uid/gid.
+    if (!write_posix_ea(handle, meta))
+        return false;
+
+    // --- Best-effort ACL for native Windows access ----------------------------
+    // No longer load-bearing for our read-back (get_ reads the EA), so its
+    // lossiness is harmless. Skip it entirely on a chown-only call.
     if (!posix_security.perms)
         return true;
 
@@ -395,7 +563,6 @@ bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
         return false;
     auto sd_guard = std::unique_ptr<void, decltype(&LocalFree)>(pSD, LocalFree);
 
-    // Owner ACEs use the file's existing owner SID; ownership is not changed.
     std::vector<BYTE> owner_sid = copy_sid(pOwner);
     if (owner_sid.empty())
         return false;
@@ -405,20 +572,12 @@ bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
     const uint32_t group_bits = (perms_val >> 3) & 0x7;
     const uint32_t others_bits = perms_val & 0x7;
 
-    // POSIX precedence: a more-specific class DENIES what a broader class grants
-    // but it shouldn't have.
     const uint32_t group_deny_bits = others_bits & ~group_bits;
     const uint32_t owner_deny_bits = (others_bits | group_bits) & ~owner_bits;
 
     std::vector<EXPLICIT_ACCESS> ea;
     ea.reserve(9);
 
-    // No inheritance anywhere. This keeps the CREATOR GROUP placeholder (S-1-3-1)
-    // a literal trustee: an inheritable placeholder would be substituted to the
-    // file's primary group SID when it became effective, which (a) breaks the
-    // read-back keyed on S-1-3-1 and (b) fuses owner and group bits whenever
-    // owner == group. Non-inheritable ACEs also match POSIX, which sets mode
-    // explicitly at create time rather than propagating bits from the parent.
     auto add_ea = [&](const std::vector<BYTE>& sid, ACCESS_MODE mode, ACCESS_MASK mask) {
         if (sid.empty())
             return;
@@ -439,8 +598,6 @@ bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
         add_ea(sid, REVOKE_ACCESS, 0);
         if (deny_bits)
             add_ea(sid, DENY_ACCESS, to_deny_mask(deny_bits));
-        // Owner keeps MIN_MANAGEMENT_RIGHTS so they retain SD control after
-        // chmod 000; these carry no data bits, so they're invisible to read-back.
         const ACCESS_MASK min_rights = is_owner ? MIN_MANAGEMENT_RIGHTS : 0;
         const ACCESS_MASK allow_mask = allow_bits ? (to_allow_mask(allow_bits) | min_rights)
                                                   : min_rights;
@@ -448,8 +605,12 @@ bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
             add_ea(sid, GRANT_ACCESS, allow_mask);
     };
 
+    // Group placeholder stays the NULL SID: it keeps the *fallback* ACL read path
+    // (get_ when no EA exists) round-tripping group bits literally. It enforces
+    // nothing, which is fine — group enforcement isn't modeled, and the EA, not
+    // this ACL, is what we read back on EA-capable volumes.
     auto world_sid = make_sid(WinWorldSid);
-    auto group_sid = make_sid(WinCreatorGroupSid);
+    auto group_sid = make_sid(WinNullSid);
     auto admin_sid = make_sid(WinBuiltinAdministratorsSid);
     if (world_sid.empty() || group_sid.empty() || admin_sid.empty())
         return false;
@@ -458,13 +619,8 @@ bool set_posix_security(HANDLE handle, PosixSecurity posix_security)
     apply_posix_rights(group_sid, group_bits, group_deny_bits);
     apply_posix_rights(owner_sid, owner_bits, owner_deny_bits, true);
 
-    // Safety net: admins keep SD read/write even if WinWorldSid carries a DENY
-    // that would otherwise lock them out. No data bits -> invisible to read-back.
     add_ea(admin_sid, SET_ACCESS, MIN_MANAGEMENT_RIGHTS);
 
-    // Strip inherited ACEs from the base so our explicit POSIX set is the only
-    // thing driving the result, symmetric with the read path which reads only
-    // the explicit view.
     std::vector<BYTE> filtered_buf;
     PACL pBaseDACL = strip_inherited_aces(pOldDACL, filtered_buf);
 
@@ -1509,13 +1665,14 @@ bool mp::platform::Platform::set_permissions(const std::filesystem::path& path,
                                              bool inherit) const
 {
 
-    HANDLE file_handle = CreateFileA(path.string().c_str(),
-                                     READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                     NULL,
-                                     OPEN_EXISTING,
-                                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                                     NULL);
+    HANDLE file_handle =
+        CreateFileA(path.string().c_str(),
+                    READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_EA | FILE_WRITE_EA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    NULL);
 
     if (file_handle == INVALID_HANDLE_VALUE)
     {
@@ -1713,7 +1870,7 @@ QString mp::platform::Platform::multipass_storage_location() const
 int mp::platform::Platform::lstat_attr_from(const char* path, sftp_attributes_struct& attr) const
 {
     HANDLE file_handle = CreateFileA(path,
-                                     READ_CONTROL,
+                                     READ_CONTROL | FILE_READ_EA,
                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                      NULL,
                                      OPEN_EXISTING,
