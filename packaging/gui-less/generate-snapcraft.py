@@ -39,7 +39,9 @@ def generate(input_path: Path, output_path: Path) -> None:
     data["platforms"]["s390x"] = None
     data["platforms"]["ppc64el"] = None
 
-    # The cmake snap on ppc64el/s390x is deprecated; use precompiled binaries from pip instead
+    # The cmake snap on ppc64el/s390x is deprecated and apt packages are not up to date;
+    # use precompiled binaries from pip instead
+    # https://discourse.cmake.org/t/announcement-dropping-architectures-from-the-cmake-snap/8116
     multipass_part = data["parts"]["multipass"]
     multipass_part["build-snaps"] = [s for s in multipass_part.get("build-snaps", []) if s != "cmake"]
     override_pull = str(multipass_part["override-pull"])
